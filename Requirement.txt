@@ -1,6 +1,5 @@
 streamlit
 pandas
 plotly
-google-cloud-firestore
-openpyxl
 firebase-admin
+openpyxl
