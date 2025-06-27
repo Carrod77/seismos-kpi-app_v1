@@ -1,13 +1,28 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from google.cloud import firestore
 from datetime import datetime, timedelta
+import firebase_admin
+from firebase_admin import credentials, firestore
 
-# Initialize Firestore
+# --- Firestore Init using st.secrets ---
 @st.cache_resource
 def get_firestore_client():
-    return firestore.Client()
+    if not firebase_admin._apps:
+        cred = credentials.Certificate({
+            "type": st.secrets["firebase"]["type"],
+            "project_id": st.secrets["firebase"]["project_id"],
+            "private_key_id": st.secrets["firebase"]["private_key_id"],
+            "private_key": st.secrets["firebase"]["private_key"].replace("\\n", "\n"),
+            "client_email": st.secrets["firebase"]["client_email"],
+            "client_id": st.secrets["firebase"]["client_id"],
+            "auth_uri": st.secrets["firebase"]["auth_uri"],
+            "token_uri": st.secrets["firebase"]["token_uri"],
+            "auth_provider_x509_cert_url": st.secrets["firebase"]["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": st.secrets["firebase"]["client_x509_cert_url"]
+        })
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
 
 db = get_firestore_client()
 
@@ -47,29 +62,30 @@ if selected_job:
         st.markdown("## 📌 Stage Completion Summary")
         grouped = kpi_df.groupby("Well Name")
         for well_name, group in grouped:
-            # Try exact match first
             total_stages = job_data["wells"].get(well_name)
 
-            # If no exact match, try fuzzy match
+            # Fuzzy match if needed
             if total_stages is None:
                 for saved_name in job_data["wells"].keys():
                     if saved_name in well_name or well_name in saved_name:
                         total_stages = job_data["wells"][saved_name]
                         break
 
-            # Fallback to 0
             if total_stages is None:
                 total_stages = 0
 
             completed = group.shape[0]
             remaining = total_stages - completed
-            st.markdown(f"**{well_name}**: {completed} / {total_stages} stages completed — <span style='color:limegreen'><strong>{remaining} remaining</strong></span>", unsafe_allow_html=True)
+            st.markdown(
+                f"**{well_name}**: {completed} / {total_stages} stages completed — "
+                f"<span style='color:limegreen'><strong>{remaining} remaining</strong></span>",
+                unsafe_allow_html=True
+            )
 
         st.markdown("## ✅ Well Quality Summary")
         selected_well = st.selectbox("Select Well", wells)
 
         if selected_well:
-            # Load quality data
             quality_docs = db.collection("jobs").document(selected_job).collection("quality").stream()
             quality_data = [doc.to_dict() for doc in quality_docs if doc.to_dict().get("well") == selected_well]
             quality_df = pd.DataFrame(quality_data)

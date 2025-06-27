@@ -1,15 +1,30 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from google.cloud import firestore
 from datetime import datetime, timedelta
+import firebase_admin
+from firebase_admin import credentials, firestore
 import json
 import os
 
-# Initialize Firestore
+# --- Initialize Firestore using Streamlit Secrets ---
 @st.cache_resource
 def get_firestore_client():
-    return firestore.Client()
+    if not firebase_admin._apps:
+        cred = credentials.Certificate({
+            "type": st.secrets["firebase"]["type"],
+            "project_id": st.secrets["firebase"]["project_id"],
+            "private_key_id": st.secrets["firebase"]["private_key_id"],
+            "private_key": st.secrets["firebase"]["private_key"].replace("\\n", "\n"),
+            "client_email": st.secrets["firebase"]["client_email"],
+            "client_id": st.secrets["firebase"]["client_id"],
+            "auth_uri": st.secrets["firebase"]["auth_uri"],
+            "token_uri": st.secrets["firebase"]["token_uri"],
+            "auth_provider_x509_cert_url": st.secrets["firebase"]["auth_provider_x509_cert_url"],
+            "client_x509_cert_url": st.secrets["firebase"]["client_x509_cert_url"]
+        })
+        firebase_admin.initialize_app(cred)
+    return firestore.client()
 
 db = get_firestore_client()
 
@@ -73,27 +88,37 @@ if uploaded_file:
         kpi_df["End time"] = pd.to_datetime(kpi_df["End time"], errors="coerce")
         kpi_df = kpi_df.dropna(subset=["Start time", "End time"])
 
-        # Save KPI data to Firestore under kpi_data subcollection
+        # Filter out previously uploaded stages
         stage_collection = db.collection("jobs").document(selected_job).collection("kpi_data")
-        existing_ids = {doc.id for doc in stage_collection.stream()}
-        kpi_df["_id"] = kpi_df.apply(lambda row: f"{row['Well Name']}_stage_{int(row['Stage'])}", axis=1)
-        new_kpi_df = kpi_df[~kpi_df["_id"].isin(existing_ids)]
+        existing_stages = stage_collection.stream()
+        uploaded_ids = {doc.id for doc in existing_stages}
 
+        def stage_id(row):
+            return f"{row['Well Name']}_stage_{int(row['Stage'])}"
+
+        kpi_df["_id"] = kpi_df.apply(stage_id, axis=1)
+        new_kpi_df = kpi_df[~kpi_df["_id"].isin(uploaded_ids)]
+
+        # Upload new stages to Firestore
         for _, row in new_kpi_df.iterrows():
-            doc_id = row["_id"]
-            data = row.drop("_id").to_dict()
-            stage_collection.document(doc_id).set(data)
+            stage_doc = stage_collection.document(row["_id"])
+            stage_doc.set(row.drop("_id").to_dict())
 
-        st.success(f"✅ Uploaded {len(new_kpi_df)} new stages to Firestore.")
+        st.success(f"✅ {len(new_kpi_df)} new stages uploaded. {len(uploaded_ids)} stages already exist and were skipped.")
+
+        # Combine all stages for timeline chart
+        all_kpi_docs = stage_collection.stream()
+        all_data = [doc.to_dict() for doc in all_kpi_docs]
+        all_df = pd.DataFrame(all_data)
 
         st.markdown("### 🕒 Stage Timeline")
-        fig = px.scatter(kpi_df, x="Start time", y="Well Name", color="Well Name",
+        fig = px.scatter(all_df, x="Start time", y="Well Name", color="Well Name",
                          hover_data=["Stage"], title="Stage Timeline")
         fig.update_traces(mode="lines+markers")
         st.plotly_chart(fig, use_container_width=True)
 
-        kpi_df["Duration (hrs)"] = (kpi_df["End time"] - kpi_df["Start time"]).dt.total_seconds() / 3600
-        grouped = kpi_df.groupby("Well Name")
+        all_df["Duration (hrs)"] = (all_df["End time"] - all_df["Start time"]).dt.total_seconds() / 3600
+        grouped = all_df.groupby("Well Name")
         job_data = db.collection("jobs").document(selected_job).get().to_dict()
 
         st.markdown("### 📈 Estimated Pad Completion")
@@ -115,7 +140,7 @@ if uploaded_file:
         st.success(f"🟢 **Projected Pad Completion:** {pad_end.strftime('%B %d, %Y @ %I:%M %p')}")
 
         with st.expander("🧾 Preview KPI Data Table"):
-            st.dataframe(kpi_df)
+            st.dataframe(all_df)
 
         with st.expander("⏳ Stage Gaps / Idle Time Analysis"):
             for well, group in grouped:
@@ -132,7 +157,7 @@ if uploaded_file:
                 os.makedirs(export_dir, exist_ok=True)
                 with open(f"{export_dir}/job_metadata.json", "w") as f:
                     json.dump(job_data, f, indent=2, default=str)
-                kpi_df.to_csv(f"{export_dir}/kpi_data.csv", index=False)
+                all_df.to_csv(f"{export_dir}/kpi_data.csv", index=False)
                 quality_entries = db.collection("jobs").document(selected_job).collection("quality").stream()
                 quality_data = [q.to_dict() for q in quality_entries]
                 pd.DataFrame(quality_data).to_csv(f"{export_dir}/quality_data.csv", index=False)
